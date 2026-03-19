@@ -1,0 +1,273 @@
+================================================================================
+  SPRITESHEET EDITOR — DESIGN DOCUMENT
+  Date: 2026-03-14
+  Stack: Python + PyQt6 + Pillow + NumPy
+================================================================================
+
+
+--------------------------------------------------------------------------------
+  PURPOSE
+--------------------------------------------------------------------------------
+
+A desktop tool for loading existing spritesheets (PNG/JPEG), extracting the
+individual sprites from them, manipulating the sprite list, and re-exporting
+as a new tightly-packed spritesheet alongside Phaser-compatible JSON metadata.
+
+The core use case: take a spritesheet with wasted space between sprites
+(e.g. 1080x128 px with 6 sprites) and produce a clean, tight sheet
+(e.g. 192x48 px) without any pixel scaling or quality loss.
+
+Original files are never modified. All exports create new files.
+
+
+--------------------------------------------------------------------------------
+  ARCHITECTURE
+--------------------------------------------------------------------------------
+
+PngManipulator/
+  main.py                   Entry point. Launches PyQt6 app with Fusion style.
+  requirements.txt          PyQt6, Pillow, NumPy
+
+  core/
+    sprite_detector.py      Sprite detection logic (no Qt dependency)
+    image_manager.py        Ordered sprite list with undo/redo
+    trimmer.py              Uniform trim logic
+    packer.py               Layout engine + Phaser JSON metadata
+    exporter.py             File I/O (PNG + JSON)
+
+  ui/
+    main_window.py          Root window, menu, signal wiring, drag-drop
+    source_panel.py         Left panel: load sheet + detection settings
+    sprites_panel.py        Right panel: sprite list, reorder, trim
+    canvas.py               Center: preview with overlays
+    toolbar.py              Bottom: output settings + export buttons
+
+
+--------------------------------------------------------------------------------
+  USER WORKFLOW
+--------------------------------------------------------------------------------
+
+1. Load a spritesheet in the Source Panel (button or drag-drop onto window).
+2. Choose Detection Mode:
+     - Regular Grid: specify rows and columns manually.
+     - Irregular / Auto-Detect: program finds non-transparent regions
+       automatically using projection-based bounding box analysis.
+3. Choose Background Mode:
+     - Transparent: sheet already has alpha transparency.
+     - Solid Color: pick a background color to strip out (replaced with alpha).
+4. Choose Layout Mode (also available in the bottom toolbar):
+     - Horizontal: each loaded sheet becomes one row in the output.
+     - Vertical: each loaded sheet becomes one column in the output.
+     - Grid: manual column count, classic grid layout.
+5. Optionally enable "Auto-trim on detect."
+6. Click "Detect Sprites." Sprites appear in the Sprites Panel.
+7. Load additional sheets and detect again to merge sprites from multiple
+   sources into one output sheet.
+8. Reorder sprites via drag-and-drop in the Sprites Panel.
+9. Trim sprites to remove transparent borders (see Trim section).
+10. Configure output in the bottom toolbar:
+      - Cell size (presets: 8, 16, 32, 48, 64, 128 px, or manual).
+      - Padding between cells.
+      - Layout mode.
+11. Preview updates in the canvas automatically.
+12. Export: PNG only, JSON only, or both together.
+
+
+--------------------------------------------------------------------------------
+  DETECTION MODES
+--------------------------------------------------------------------------------
+
+REGULAR GRID (core/sprite_detector.py — detect_regular)
+  Slices the sheet into a rows x cols grid. Empty cells (fully transparent
+  or matching the background color) are skipped. Each cell becomes one sprite.
+  When Layout is set to Horizontal, Rows is locked to 1.
+  When Layout is set to Vertical, Cols is locked to 1.
+
+IRREGULAR / AUTO-DETECT (core/sprite_detector.py — detect_irregular)
+  Uses row/column projection to find non-empty bounding boxes:
+    1. Project the alpha mask onto the Y axis to find horizontal bands.
+    2. Within each band, project onto the X axis to find individual sprites.
+    3. Compute tight bounding boxes and crop each sprite.
+  Sprites are sorted left-to-right, top-to-bottom.
+  No external dependencies (no scipy) — pure NumPy projection approach.
+
+BACKGROUND HANDLING
+  Transparent mode: empty = alpha == 0.
+  Solid color mode: user picks a color (or program auto-detects from corners).
+    Pixels matching that color have their alpha set to 0 after cropping.
+
+
+--------------------------------------------------------------------------------
+  IMAGE MANAGER + UNDO/REDO (core/image_manager.py)
+--------------------------------------------------------------------------------
+
+SpriteEntry fields:
+  name          String identifier (used as frame key in Phaser JSON).
+  image         PIL RGBA image (the cropped sprite).
+  source_file   Path to the sheet this sprite was detected from.
+                Used to group sprites by sheet in Horizontal/Vertical layouts.
+
+ImageManager maintains an ordered list of SpriteEntry objects.
+Every mutating operation (add, remove, reorder, trim, clear) first saves
+a snapshot to an undo stack (max 50 entries). The redo stack is cleared
+on any new mutation.
+
+Undo: Ctrl+Z  /  Redo: Ctrl+Y  (Edit menu in main window)
+
+
+--------------------------------------------------------------------------------
+  TRIM FEATURE (core/trimmer.py)
+--------------------------------------------------------------------------------
+
+Goal: remove transparent borders from sprites so the output sheet is as
+      compact as possible, without any pixel scaling.
+
+Algorithm (uniform trim):
+  1. For each selected sprite, compute its content bounding box
+     (leftmost/rightmost/topmost/bottommost non-transparent pixel).
+  2. Find the minimum transparent border on each side across ALL selected
+     sprites (safe margins).
+  3. Apply that same crop to every selected sprite.
+  Result: all output cells are the same size, no sprite content is cut.
+
+Key functions:
+  get_content_bbox(img)            -> (left, top, right, bottom) or None
+  compute_safe_margins(sprites)    -> (left, top, right, bottom) crop amounts
+  apply_trim(sprites, margins)     -> new list of SpriteEntry
+
+UI controls:
+  "Trim All" button   — header of Sprites Panel, applies to all sprites.
+  "Trim Selected"     — button + right-click menu, applies to selection only.
+  Multi-select        — Shift+click / Ctrl+click in the Sprites Panel.
+  Auto-trim checkbox  — in Source Panel; trims automatically after each detect.
+  All trim operations are undoable via Ctrl+Z.
+
+
+--------------------------------------------------------------------------------
+  LAYOUT MODES (core/packer.py)
+--------------------------------------------------------------------------------
+
+HORIZONTAL (LAYOUT_HORIZONTAL)
+  Each distinct source_file group occupies one row in the output.
+  Shorter rows are padded with empty cells to match the widest row.
+  Sheet width  = max(sprites per group) * cell_w + padding
+  Sheet height = number of groups       * cell_h + padding
+  The Columns spinbox in the toolbar is hidden in this mode.
+
+VERTICAL (LAYOUT_VERTICAL)
+  Each distinct source_file group occupies one column.
+  Shorter columns padded to match the tallest column.
+  Sheet width  = number of groups       * cell_w + padding
+  Sheet height = max(sprites per group) * cell_h + padding
+  The Columns spinbox is hidden in this mode.
+
+GRID (LAYOUT_GRID)
+  Classic row-wrap grid. Column count set manually via the spinbox.
+  Sheet width  = columns * cell_w + padding
+  Sheet height = rows    * cell_h + padding
+
+Layout radio buttons appear in both the Source Panel and the bottom toolbar
+and are always kept in sync. Changing one updates the other.
+
+Source grouping is determined by the source_file field on each SpriteEntry.
+Sprites detected from the same file belong to the same group.
+Manual reorder across groups is tracked visually but group boundaries
+follow source file — cross-group manual reorder is deferred to a future
+session.
+
+
+--------------------------------------------------------------------------------
+  PACKER (core/packer.py)
+--------------------------------------------------------------------------------
+
+GridPacker.pack(manager, columns, cell_w, cell_h, padding, layout)
+  -> PIL RGBA Image
+
+  Sprites are centered within each cell. No upscaling is ever applied.
+  If a sprite is larger than the cell, it is downscaled proportionally
+  using NEAREST resampling to preserve pixel art quality.
+
+GridPacker.metadata(manager, columns, cell_w, cell_h, padding,
+                    image_filename, layout)
+  -> dict (Phaser JSON Hash format)
+
+  Output format is compatible with Phaser 3 and TexturePacker JSON Hash.
+  Each frame entry:
+    "frame":             {x, y, w, h}   position in the packed sheet
+    "rotated":           false
+    "trimmed":           false
+    "spriteSourceSize":  {x:0, y:0, w, h}
+    "sourceSize":        {w, h}
+  Meta section includes image filename, sheet dimensions, scale "1".
+
+GridPacker.get_positions(manager, columns, cell_w, cell_h, padding, layout)
+  -> list of (x, y) cell origins
+  Used by main_window to compute content rects for canvas overlays.
+
+
+--------------------------------------------------------------------------------
+  EXPORTER (core/exporter.py)
+--------------------------------------------------------------------------------
+
+export_png(sheet, path)              Saves PIL image as PNG.
+export_json(metadata, path)          Saves Phaser JSON with 2-space indent.
+export_both(sheet, metadata, path)   Saves PNG + matching .json alongside it.
+
+Output files are always new files — source sheets are never overwritten.
+Suggested naming convention: append "_packed" suffix (e.g. player_packed.png).
+
+
+--------------------------------------------------------------------------------
+  CANVAS (ui/canvas.py)
+--------------------------------------------------------------------------------
+
+Displays the packed output sheet as a live preview.
+
+Overlays drawn in drawForeground() (scene coordinates, cosmetic 1px pens):
+  Red grid    — cell boundaries (always visible when sheet is loaded).
+  Blue rects  — content bounding box of each sprite within its cell.
+                Shows how much empty space remains before trimming.
+                Collapses to match the red grid after a full trim.
+
+Info overlay (painted on viewport, top-right corner):
+  Cell: W x H px
+  Sprites: N
+  Zoom: X%
+
+Interaction:
+  Scroll wheel    — zoom in/out (1.2x factor per step, anchored at cursor).
+  Click + drag    — pan.
+  Nearest-neighbour rendering (SmoothPixmapTransform disabled) — pixels
+  stay sharp at all zoom levels, critical for pixel art.
+  Pan/zoom position is preserved when the sheet is refreshed.
+
+
+--------------------------------------------------------------------------------
+  KEY DESIGN DECISIONS
+--------------------------------------------------------------------------------
+
+- Always NEAREST resampling (Pillow Image.Resampling.NEAREST). No blurring.
+- PIL -> QPixmap conversion via io.BytesIO + QImage.loadFromData.
+- Canvas SmoothPixmapTransform disabled for sharp pixel rendering.
+- Cosmetic QPen for grid lines (always 1px regardless of zoom level).
+- Undo snapshots store SpriteEntry wrappers with shared PIL image references
+  (images are not deep-copied, keeping memory usage low).
+- Trim operates on safe margins only — content is never cut from any sprite.
+- Source grouping by source_file path string for H/V layout modes.
+- Phaser JSON Hash format chosen for Phaser 3 compatibility and wide
+  toolchain support (TexturePacker, Aseprite, etc.).
+- Checker background (grey tiles) in canvas = standard transparency indicator.
+- Original source files are NEVER modified or overwritten.
+
+
+--------------------------------------------------------------------------------
+  FUTURE / DEFERRED
+--------------------------------------------------------------------------------
+
+- Manual reorder across source groups in Horizontal/Vertical mode.
+- Crop entire output sheet outer border.
+- Batch export (multiple sheets with shared or per-file settings).
+- Per-frame name editing in the Sprites Panel.
+- Zoom controls (buttons + input) in addition to scroll wheel.
+
+================================================================================

@@ -1,0 +1,10 @@
+PyQt6>=6.4.0
+Pillow>=9.1.0
+numpy>=1.23.0
+
+# Optional: AI upscaling (Real-ESRGAN). Adds ~200 MB (PyTorch + weights).
+# pip install realesrgan basicsr torch torchvision
+# realesrgan
+# basicsr
+# torch
+# torchvision
